@@ -11,7 +11,6 @@ def parse_node(url_str):
     params = dict(urllib.parse.parse_qsl(u.query))
 
     if scheme in ("hy2", "hysteria2"):
-        # URL 解码防止密码中含有特殊符号
         auth = urllib.parse.unquote(u.username or "")
         if u.password:
             auth += ":" + urllib.parse.unquote(u.password)
