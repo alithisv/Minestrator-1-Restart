@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import uuid
 import urllib.request
 import urllib.parse
 import re
@@ -24,14 +25,14 @@ SERVER_URL = f"https://minestrator.com/my/server/{SERVER_ID}"
 API_URL    = f"https://mine.sttr.io/server/{SERVER_ID}/poweraction"
 
 # ============================================================
-# TG 推送（可选）
+# TG 推送（支持携带图片发送）
 # ============================================================
 
 def now_str():
     import datetime
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-def send_tg(result, detail=''):
+def send_tg(result, detail='', photo_path=None):
     if not TG_TOKEN or not TG_CHAT_ID:
         print("ℹ️ 未配置 TG_BOT，跳过推送")
         return
@@ -41,13 +42,54 @@ def send_tg(result, detail=''):
         f"🖥 服务器: 🇫🇷 Minestrator-FR\n"
         f"📊 结果: {result}\n"
         f"{detail}"
-    )
+    ).strip()
+
+    # 如果提供了截图文件且文件存在，调用 sendPhoto 直接把图片发到 TG
+    if photo_path and os.path.exists(photo_path):
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+        boundary = uuid.uuid4().hex
+        body = []
+        
+        # chat_id 字段
+        body.append(f"--{boundary}\r\n".encode())
+        body.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
+        body.append(f"{TG_CHAT_ID}\r\n".encode())
+        
+        # caption 字段（图片说明文字）
+        body.append(f"--{boundary}\r\n".encode())
+        body.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
+        body.append(f"{msg}\r\n".encode())
+        
+        # photo 二进制文件字段
+        filename = os.path.basename(photo_path)
+        body.append(f"--{boundary}\r\n".encode())
+        body.append(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
+        body.append(b"Content-Type: image/png\r\n\r\n")
+        with open(photo_path, "rb") as f:
+            body.append(f.read())
+        body.append(b"\r\n")
+        body.append(f"--{boundary}--\r\n".encode())
+        
+        payload = b"".join(body)
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(payload))
+        }
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30):
+                print(f"📨 TG图文推送成功 ({filename})")
+            return
+        except Exception as e:
+            print(f"⚠️ TG图片推送失败，回退为纯文本推送：{e}")
+
+    # 纯文本推送
     url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": msg}).encode()
     try:
         req = urllib.request.Request(url, data=data, method="POST")
         with urllib.request.urlopen(req, timeout=15):
-            print("📨 TG推送成功")
+            print("📨 TG文本推送成功")
     except Exception as e:
         print(f"⚠️ TG推送失败：{e}")
 
@@ -115,7 +157,7 @@ def wait_for_token(sb, timeout=60) -> str:
         try:
             token = sb.execute_script("""
                 (function(){
-                    var inp = document.querySelector('input[name="cf-turnstile-response"]');
+                    var inp = document.querySelector('input[name="cf-turnstile-response"], input[name="cf_turnstile_response"]');
                     return (inp && inp.value && inp.value.length > 50) ? inp.value : '';
                 })()
             """)
@@ -193,48 +235,70 @@ def run_script():
 
         # ── 登录 ─────────────────────────────────────────────
         print("🔑 打开登录页面...")
-        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
+        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
         time.sleep(3)
 
         print("✏️ 填写账号密码...")
         try:
-            sb.wait_for_element_visible("input[name='pseudo']", timeout=20)
-            sb.type("input[name='pseudo']", EMAIL)
-            sb.type("input[name='password']", PASSWORD)
-            try:
-                sb.execute_script(
-                    "var r=document.querySelector('#remember'); if(r) r.checked=true;"
-                )
-            except Exception:
-                pass
-        except Exception:
-            print("❌ 登录框加载失败")
+            # 等待密码框出现即可确认新版登录表单已渲染完毕
+            sb.wait_for_element_visible("input[type='password']", timeout=25)
+            
+            # 兼容新版 UI：优先匹配 placeholder 含 utilisateur 或 email/pseudo，否则直接取页面中密码框上方的第一个可见文本输入框
+            user_selectors = [
+                "input[placeholder*='utilisateur']",
+                "input[name='pseudo']",
+                "input[name='email']",
+                "input[type='text']",
+                "input[type='email']",
+                "input:not([type='password']):not([type='checkbox']):not([type='hidden'])"
+            ]
+            typed_user = False
+            for sel in user_selectors:
+                if sb.is_element_visible(sel):
+                    sb.type(sel, EMAIL)
+                    print(f"✅ 已使用选择器填写账号: {sel}")
+                    typed_user = True
+                    break
+            if not typed_user:
+                raise RuntimeError("未找到可见的账号输入框")
+
+            sb.type("input[type='password']", PASSWORD)
+        except Exception as e:
+            print(f"❌ 登录框加载或填写失败：{e}")
             sb.save_screenshot("login_fail.png")
+            send_tg("❌ 登录框加载失败", f"原因: {e}", photo_path="login_fail.png")
             return
 
         print("📤 提交登录请求...")
         try:
-            sb.find_element("button[type='submit']").click()
-        except Exception:
-            try:
-                sb.find_element(".btn-text").click()
-            except Exception:
-                print("❌ 登录按钮不可用")
-                sb.save_screenshot("login_submit_fail.png")
-                return
+            # 兼容新版橙色 "Se connecter" 按钮
+            clicked = sb.execute_script("""
+                var btns = Array.from(document.querySelectorAll('button'));
+                var target = btns.find(b => b.textContent.includes('Se connecter') || b.type === 'submit');
+                if (target) { target.click(); return true; }
+                return false;
+            """)
+            if not clicked:
+                sb.click("button:contains('Se connecter')")
+        except Exception as e:
+            print(f"❌ 登录按钮点击失败：{e}")
+            sb.save_screenshot("login_submit_fail.png")
+            send_tg("❌ 登录按钮不可用", f"原因: {e}", photo_path="login_submit_fail.png")
+            return
 
         print("⏳ 等待登录跳转...")
-        for _ in range(40):
+        for _ in range(45):
             try:
                 if "/connexion" not in sb.get_current_url():
                     print(f"✅ 登录成功！当前页：{sb.get_current_url()}")
                     break
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(1)
         else:
             print("❌ 登录等待超时")
             sb.save_screenshot("login_timeout.png")
+            send_tg("❌ 登录等待超时", "提交账号密码后页面未跳转，请查看截图提示", photo_path="login_timeout.png")
             return
 
         # ── 跳转服务器管理页 ──────────────────────────────────
@@ -251,13 +315,13 @@ def run_script():
         token = wait_for_token(sb, timeout=60)
         if not token:
             sb.save_screenshot("token_timeout.png")
-            send_tg("❌ Token 获取超时", "Turnstile 未能自动完成")
+            send_tg("❌ Token 获取超时", "Turnstile 未能自动完成", photo_path="token_timeout.png")
             return
 
         # ── 发送重启指令 ──────────────────────────────────────
         if not send_restart(sb, token):
             sb.save_screenshot("api_fail.png")
-            send_tg("❌ API 重启请求失败", f"Token长度={len(token)}")
+            send_tg("❌ API 重启请求失败", f"Token长度={len(token)}", photo_path="api_fail.png")
             return
 
         # ── 刷新页面，等待剩余时间更新 ──────────────────────
@@ -265,6 +329,7 @@ def run_script():
         time.sleep(5)
         sb.open(SERVER_URL)
         time.sleep(5)
+        sb.save_screenshot("restart_success.png")
         try:
             remaining = sb.execute_script(r"""
                 (function(){
@@ -277,11 +342,11 @@ def run_script():
                     return parts.length ? parts.join(' ') : '';
                 })()
             """)
-            detail = f"⏰ 利用期限：{remaining}" if remaining else "⏰ 利用期限：获取失败"
+            detail = f"⏰ 利用期限：{remaining}" if remaining else "⏰ 利用期限：已刷新（请查看截图）"
         except Exception:
-            detail = "利用期限：获取失败"
+            detail = "⏰ 利用期限：获取失败"
         print(f"⏱️ {detail}")
-        send_tg("✅ 重启成功！", detail)
+        send_tg("✅ 重启成功！", detail, photo_path="restart_success.png")
 
 
 if __name__ == "__main__":
