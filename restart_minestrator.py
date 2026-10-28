@@ -13,7 +13,7 @@ SERVER_ID  = os.environ.get("MINESTRATOR_SERVER_ID", "").strip()
 AUTH_TOKEN = os.environ.get("MINESTRATOR_AUTH", "").strip()
 
 _proxy = os.environ.get("GOST_PROXY", "").strip()
-LOCAL_PROXY = "http://127.0.0.1:8080" if _proxy else None
+LOCAL_PROXY = "127.0.0.1:8080" if _proxy else None
 
 _tg = os.environ.get("TG_BOT", "").strip()
 TG_CHAT_ID = _tg.split(",")[0].strip() if _tg else ""
