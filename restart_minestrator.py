@@ -50,17 +50,14 @@ def send_tg(result, detail='', photo_path=None):
         boundary = uuid.uuid4().hex
         body = []
         
-        # chat_id 字段
         body.append(f"--{boundary}\r\n".encode())
         body.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
         body.append(f"{TG_CHAT_ID}\r\n".encode())
         
-        # caption 字段（图片说明文字）
         body.append(f"--{boundary}\r\n".encode())
         body.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
         body.append(f"{msg}\r\n".encode())
         
-        # photo 二进制文件字段
         filename = os.path.basename(photo_path)
         body.append(f"--{boundary}\r\n".encode())
         body.append(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
@@ -240,10 +237,8 @@ def run_script():
 
         print("✏️ 填写账号密码...")
         try:
-            # 等待密码框出现即可确认新版登录表单已渲染完毕
             sb.wait_for_element_visible("input[type='password']", timeout=25)
             
-            # 兼容新版 UI：优先匹配 placeholder 含 utilisateur 或 email/pseudo，否则直接取页面中密码框上方的第一个可见文本输入框
             user_selectors = [
                 "input[placeholder*='utilisateur']",
                 "input[name='pseudo']",
@@ -271,15 +266,24 @@ def run_script():
 
         print("📤 提交登录请求...")
         try:
-            # 兼容新版橙色 "Se connecter" 按钮
-            clicked = sb.execute_script("""
-                var btns = Array.from(document.querySelectorAll('button'));
-                var target = btns.find(b => b.textContent.includes('Se connecter') || b.type === 'submit');
-                if (target) { target.click(); return true; }
-                return false;
-            """)
-            if not clicked:
+            # 优先使用 SeleniumBase 原生点击，失败则使用 IIFE 闭包包裹的 JS 点击（避免 Illegal return statement）
+            if sb.is_element_visible("button:contains('Se connecter')"):
                 sb.click("button:contains('Se connecter')")
+                print("✅ 已点击 Se connecter 登录按钮")
+            elif sb.is_element_visible("button[type='submit']"):
+                sb.click("button[type='submit']")
+                print("✅ 已点击 submit 登录按钮")
+            else:
+                sb.execute_script("""
+                    (function(){
+                        var btns = Array.from(document.querySelectorAll('button'));
+                        var target = btns.find(function(b){
+                            return b.textContent.indexOf('Se connecter') !== -1 || b.type === 'submit';
+                        });
+                        if (target) target.click();
+                    })()
+                """)
+                print("✅ 已通过 JS 触发登录按钮点击")
         except Exception as e:
             print(f"❌ 登录按钮点击失败：{e}")
             sb.save_screenshot("login_submit_fail.png")
