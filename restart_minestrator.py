@@ -24,23 +24,25 @@ LOGIN_URL  = "https://minestrator.com/connexion"
 SERVER_URL = f"https://minestrator.com/my/server/{SERVER_ID}"
 API_URL    = f"https://mine.sttr.io/server/{SERVER_ID}/poweraction"
 
+
 # ============================================================
-# TG 推送（支持携带图片发送）
+# TG 推送（支持完整图文推送 + 纯文本回退）
 # ============================================================
 
 def now_str():
     import datetime
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+
 def send_tg(result, detail='', photo_path=None):
     if not TG_TOKEN or not TG_CHAT_ID:
         print("ℹ️ 未配置 TG_BOT，跳过推送")
         return
     msg = (
-        f"🎮 Minestrator 保活巡检\n"
+        f"🎮 Minestrator 重启通知\n"
         f"🕐 运行时间: {now_str()}\n"
         f"🖥 服务器ID: {SERVER_ID}\n"
-        f"📊 状态: {result}\n"
+        f"📊 结果: {result}\n"
         f"{detail}"
     ).strip()
 
@@ -48,15 +50,15 @@ def send_tg(result, detail='', photo_path=None):
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
         boundary = uuid.uuid4().hex
         body = []
-        
+
         body.append(f"--{boundary}\r\n".encode())
         body.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
         body.append(f"{TG_CHAT_ID}\r\n".encode())
-        
+
         body.append(f"--{boundary}\r\n".encode())
         body.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
         body.append(f"{msg}\r\n".encode())
-        
+
         filename = os.path.basename(photo_path)
         body.append(f"--{boundary}\r\n".encode())
         body.append(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
@@ -65,7 +67,7 @@ def send_tg(result, detail='', photo_path=None):
             body.append(f.read())
         body.append(b"\r\n")
         body.append(f"--{boundary}--\r\n".encode())
-        
+
         payload = b"".join(body)
         headers = {
             "Content-Type": f"multipart/form-data; boundary={boundary}",
@@ -79,7 +81,7 @@ def send_tg(result, detail='', photo_path=None):
         except Exception as e:
             print(f"⚠️ TG图片推送失败，回退为纯文本推送：{e}")
 
-    url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": msg}).encode()
     try:
         req = urllib.request.Request(url, data=data, method="POST")
@@ -90,7 +92,7 @@ def send_tg(result, detail='', photo_path=None):
 
 
 # ============================================================
-# Turnstile 监听器（仅在进入服务器管理页后注入）
+# Invisible Turnstile：注入监听器 + Hook 捕获 Token
 # ============================================================
 
 INJECT_TOKEN_LISTENER_JS = """
@@ -98,18 +100,46 @@ INJECT_TOKEN_LISTENER_JS = """
     if (window.__cf_token_listener_injected__) return;
     window.__cf_token_listener_injected__ = true;
     window.__cf_turnstile_token__ = '';
+    window.__captured_auth_header__ = '';
 
+    // 1. 监听 Cloudflare Turnstile postMessage 事件
     window.addEventListener('message', function(e) {
         if (!e.origin || e.origin.indexOf('cloudflare.com') === -1) return;
         var d = e.data;
-        if (d && d.token && d.token.length > 30) {
+        if (!d) return;
+        if (d.token && d.token.length > 30) {
+            console.log('[TokenCapture] postMessage token length:', d.token.length);
             window.__cf_turnstile_token__ = d.token;
         }
     });
 
+    // 2. Hook window.fetch，捕获网页自身发出的 turnstile_token 和 Authorization
+    var origFetch = window.fetch;
+    window.fetch = function() {
+        var args = arguments;
+        try {
+            if (args[1]) {
+                if (args[1].headers) {
+                    var auth = args[1].headers['Authorization'] || args[1].headers['authorization'];
+                    if (auth) window.__captured_auth_header__ = auth;
+                }
+                if (args[1].body && typeof args[1].body === 'string') {
+                    var parsed = JSON.parse(args[1].body);
+                    if (parsed.turnstile_token) {
+                        window.__cf_turnstile_token__ = parsed.turnstile_token;
+                    }
+                }
+            }
+        } catch(e) {}
+        return origFetch.apply(this, args);
+    };
+
+    // 3. 定时轮询页面隐藏的 turnstile input 与全局对象
     setInterval(function() {
         try {
-            var inputs = document.querySelectorAll('input[name*="turnstile"], input[name*="cf-"], textarea[name*="cf-"]');
+            var inputs = document.querySelectorAll(
+                'input[name="cf-turnstile-response"], input[name="cf_turnstile_response"], input[name*="turnstile"]'
+            );
             for (var i = 0; i < inputs.length; i++) {
                 if (inputs[i].value && inputs[i].value.length > 30) {
                     window.__cf_turnstile_token__ = inputs[i].value;
@@ -129,28 +159,87 @@ INJECT_TOKEN_LISTENER_JS = """
 READ_TOKEN_JS = "(function(){ return window.__cf_turnstile_token__ || ''; })()"
 
 
-def trigger_login_submit(sb):
-    """多种方式组合触发登录提交（物理点击 + JS点击 + 表单回车提交）"""
+def inject_listener(sb):
     try:
-        # 1. 确保输入框的值已同步给 Vue/React 状态机
-        sb.execute_script("""
-            (function(){
-                var inputs = document.querySelectorAll('input');
-                for (var i = 0; i < inputs.length; i++) {
-                    inputs[i].dispatchEvent(new Event('input', {bubbles: true}));
-                    inputs[i].dispatchEvent(new Event('change', {bubbles: true}));
-                    inputs[i].dispatchEvent(new Event('blur', {bubbles: true}));
-                }
-            })()
-        """)
-    except Exception:
-        pass
+        sb.execute_script(INJECT_TOKEN_LISTENER_JS)
+        print("📡 Turnstile 监听器已注入")
+    except Exception as e:
+        print(f"⚠️ 监听器注入失败：{e}")
 
-    # 2. 尝试点击 Se connecter 按钮
+
+def wait_for_token(sb, timeout=25) -> str:
+    print(f"⏳ 等待 Turnstile Token 自动生成（最多 {timeout} 秒）...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            token = sb.execute_script(READ_TOKEN_JS)
+            if token and len(token) > 30:
+                print(f"✅ Token 已捕获（长度 {len(token)}）")
+                return token
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("ℹ️ 未单独捕获到明文 Turnstile Token")
+    return ''
+
+
+# ============================================================
+# 登录辅助：兼容新版 Vue/React 登录表单与多方式提交
+# ============================================================
+
+def fill_and_submit_login(sb) -> bool:
+    print("✏️ 填写账号密码...")
+    try:
+        sb.wait_for_element_visible("input[type='password']", timeout=25)
+
+        # 使用原生 setter 写入值并派发完整事件链，确保前端框架绑定生效
+        fill_js = """
+        (function(email, pwd) {
+            var userInp = document.querySelector("input[placeholder*='utilisateur']")
+                       || document.querySelector("input[name='pseudo']")
+                       || document.querySelector("input[name='email']")
+                       || document.querySelector("input[type='text']")
+                       || document.querySelector("input[type='email']");
+            var passInp = document.querySelector("input[type='password']");
+            if (!userInp || !passInp) return false;
+
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+
+            nativeInputValueSetter.call(userInp, email);
+            userInp.dispatchEvent(new Event('input', { bubbles: true }));
+            userInp.dispatchEvent(new Event('change', { bubbles: true }));
+
+            nativeInputValueSetter.call(passInp, pwd);
+            passInp.dispatchEvent(new Event('input', { bubbles: true }));
+            passInp.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        })(arguments[0], arguments[1]);
+        """
+        ok = sb.execute_script(fill_js, EMAIL, PASSWORD)
+        if not ok:
+            # 备用常规输入
+            sb.type("input[placeholder*='utilisateur'], input[type='text']", EMAIL)
+            sb.type("input[type='password']", PASSWORD)
+        print("✅ 账号密码已填入并同步表单状态")
+    except Exception as e:
+        print(f"❌ 登录框加载或填写失败：{e}")
+        return False
+
+    time.sleep(2)
+    print("📤 提交登录请求...")
+    trigger_login_button(sb)
+    return True
+
+
+def trigger_login_button(sb):
+    """尝试通过 Selenium 原生点击 + JS 点击触发 Se connecter 按钮"""
     try:
         if sb.is_element_visible("button:contains('Se connecter')"):
             sb.click("button:contains('Se connecter')")
-            print("🔘 已点击 Se connecter 按钮")
+            print("✅ 已点击 Se connecter 登录按钮")
             return
     except Exception:
         pass
@@ -168,91 +257,141 @@ def trigger_login_submit(sb):
                 }
             })()
         """)
-        print("🔘 已通过 JS 触发登录按钮")
+        print("✅ 已通过 JS 触发 Se connecter 登录按钮")
     except Exception as e:
-        print(f"⚠️ 触发登录按钮异常: {e}")
+        print(f"⚠️ 点击登录按钮异常：{e}")
 
 
-def check_and_click_renew(sb) -> dict:
+# ============================================================
+# 服务器电源控制：同时支持“离线开机 (Démarrer)”与“在线重启 (Restart)”
+# ============================================================
+
+def check_server_and_click_power(sb) -> dict:
     """
-    检查页面上是否出现了 Renew / Renouveler / Prolonger（续期）按钮或链接。
-    如果出现则自动点击；同时检查服务器是否 Offline，若离线则顺便点击蓝色启动按钮。
+    识别当前服务器是离线 (Hors ligne / Offline) 还是在线 (En ligne / Online)：
+    - 若已离线：自动点击绿色的 'Démarrer le serveur' 或 'Démarrer' 按钮开机
+    - 若在线中：自动点击左上角三个并排按钮中的黄色重启按钮，刷新 4 小时倒计时
     """
-    js_code = """
+    js_power = """
     (function() {
-        var result = {
-            renew_found: false,
-            renew_clicked_text: '',
-            server_status: 'unknown',
-            start_clicked: false,
-            banner_text: ''
+        var res = {
+            status: 'unknown',
+            clicked: false,
+            action_type: '',
+            detail: '',
+            countdown: ''
         };
 
         var bodyText = document.body.innerText || '';
-        var m = bodyText.match(/You are currently on a trial offer[^\\n]+/i) ||
-                bodyText.match(/Vous profitez actuellement[^\\n]+/i) ||
-                bodyText.match(/您目前正在享受试用优惠[^\\n]+/);
-        if (m) result.banner_text = m[0].trim();
 
-        var keywords = ['renew', 'renouveler', 'prolonger', 'extend', '续订', '续期', '延长'];
-        var clickables = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-        for (var i = 0; i < clickables.length; i++) {
-            var el = clickables[i];
-            if (el.offsetParent === null) continue;
-            var txt = (el.textContent || '').trim().toLowerCase();
-            if (txt.length > 0 && txt.length < 40) {
-                for (var k = 0; k < keywords.length; k++) {
-                    if (txt.indexOf(keywords[k]) !== -1) {
-                        el.click();
-                        result.renew_found = true;
-                        result.renew_clicked_text = (el.textContent || '').trim();
-                        break;
-                    }
-                }
-            }
-            if (result.renew_found) break;
+        // 1. 提取右上角 4 小时倒计时（如 S'éteint dans 3h 32m 50s）
+        var mTimer = bodyText.match(/S'éteint dans\\s+([^\\n]+)/i)
+                  || bodyText.match(/Shutting down in\\s+([^\\n]+)/i)
+                  || bodyText.match(/\\d+h\\s+\\d+m\\s+\\d+s/);
+        if (mTimer) {
+            res.countdown = mTimer[0].trim();
         }
 
-        if (/Online|En ligne|在线/i.test(bodyText)) {
-            result.server_status = 'Online';
-        } else if (/Offline|Hors ligne|离线|Stopped|Arrêté/i.test(bodyText)) {
-            result.server_status = 'Offline';
+        // 2. 判断当前状态是 Hors ligne (Offline) 还是 En ligne (Online)
+        if (/Hors ligne|Serveur hors ligne|Offline|Server offline/i.test(bodyText)) {
+            res.status = 'Offline (已关机)';
+        } else if (/En ligne|Online/i.test(bodyText)) {
+            res.status = 'Online (运行中)';
         }
 
-        if (result.server_status === 'Offline') {
-            var allBtns = Array.from(document.querySelectorAll('button'));
-            for (var j = 0; j < allBtns.length; j++) {
-                var parent = allBtns[j].parentElement;
-                if (!parent) continue;
-                var siblingBtns = parent.querySelectorAll(':scope > button');
-                if (siblingBtns.length === 3 && !siblingBtns[0].disabled) {
-                    siblingBtns[0].click();
-                    result.start_clicked = true;
-                    break;
-                }
+        var allBtns = Array.from(document.querySelectorAll('button'));
+
+        // 3. 情况 A：服务器处于关机状态 -> 寻找绿色 Démarrer / Start 按钮并点击开机
+        for (var i = 0; i < allBtns.length; i++) {
+            var b = allBtns[i];
+            if (b.offsetParent === null || b.disabled) continue;
+            var txt = (b.textContent || '').trim();
+            if (/Démarrer le serveur|Démarrer|Start server|^Start$/i.test(txt)) {
+                b.click();
+                res.clicked = true;
+                res.action_type = 'start';
+                res.detail = '已点击绿色启动按钮 (' + txt + ')';
+                return res;
             }
         }
 
-        return result;
+        // 4. 情况 B：服务器处于运行中状态 -> 寻找左上角并排的三个控制按钮（蓝、黄、红），点击中间黄色重启按钮
+        for (var j = 0; j < allBtns.length; j++) {
+            var parent = allBtns[j].parentElement;
+            if (!parent) continue;
+            var siblingBtns = parent.querySelectorAll(':scope > button');
+            if (siblingBtns.length === 3) {
+                var blueBtn   = siblingBtns[0];
+                var yellowBtn = siblingBtns[1]; // 中间黄色按钮为重启 (Restart)
+                if (yellowBtn && !yellowBtn.disabled) {
+                    yellowBtn.click();
+                    res.clicked = true;
+                    res.action_type = 'restart';
+                    res.detail = '已点击左上角黄色重启按钮 (Restart)';
+                    return res;
+                } else if (blueBtn && !blueBtn.disabled) {
+                    blueBtn.click();
+                    res.clicked = true;
+                    res.action_type = 'start';
+                    res.detail = '已点击左上角蓝色启动按钮';
+                    return res;
+                }
+            }
+        }
+
+        return res;
     })()
     """
     try:
-        return sb.execute_script(js_code) or {}
+        data = sb.execute_script(js_power) or {}
+        print(f"🔍 页面状态检测：{data}")
+        return data
     except Exception as e:
-        print(f"⚠️ 检查续期按钮异常: {e}")
+        print(f"⚠️ 页面电源按钮操作异常：{e}")
         return {}
 
 
-def send_api_action(sb, token: str, action="restart") -> bool:
-    if not AUTH_TOKEN or not token:
+def get_countdown_text(sb) -> str:
+    """获取刷新后的 4 小时倒计时文本"""
+    try:
+        txt = sb.execute_script(r"""
+            (function(){
+                var bodyText = document.body.innerText || '';
+                var m = bodyText.match(/S'éteint dans\s+([^\n]+)/i)
+                     || bodyText.match(/Shutting down in\s+([^\n]+)/i)
+                     || bodyText.match(/\d+h\s+\d+m\s+\d+s/);
+                if (m) return m[0].trim();
+
+                var spans = document.querySelectorAll('[data-slot="base"] span');
+                var parts = [];
+                for (var i = 0; i < spans.length; i++) {
+                    var t = spans[i].textContent.trim();
+                    if (/^\d+[hms]$/.test(t)) parts.push(t);
+                }
+                return parts.length ? parts.join(' ') : '';
+            })()
+        """)
+        return txt or ""
+    except Exception:
+        return ""
+
+
+# ============================================================
+# API：通过浏览器 fetch 发送重启/启动指令（携带登录 Cookie）
+# ============================================================
+
+def send_power_api(sb, token: str, action: str = "restart") -> bool:
+    if not token:
         return False
     token_js = json.dumps(token)
+    auth_js = json.dumps(AUTH_TOKEN)
     script = (
         "var done = arguments[0];"
+        "var authHeader = window.__captured_auth_header__ || " + auth_js + ";"
         'fetch("' + API_URL + '", {'
         '  method: "PUT",'
         '  headers: {'
-        '    "Authorization": "' + AUTH_TOKEN + '",'
+        '    "Authorization": authHeader,'
         '    "Content-Type": "application/json",'
         '    "Accept": "application/json",'
         '    "X-Requested-With": "XMLHttpRequest"'
@@ -266,8 +405,13 @@ def send_api_action(sb, token: str, action="restart") -> bool:
     try:
         result = sb.execute_async_script(script)
         print(f"📡 API ({action}) 响应：{result}")
-        return bool(result.get("ok") and result.get("data", {}).get("api", {}).get("code") == 200)
-    except Exception:
+        if result.get("ok") and result.get("data", {}).get("api", {}).get("code") == 200:
+            print(f"✅ API ({action}) 指令已成功送达！")
+            return True
+        print(f"⚠️ API ({action}) 返回非 200：{result}")
+        return False
+    except Exception as e:
+        print(f"⚠️ API 请求异常：{e}")
         return False
 
 
@@ -276,7 +420,7 @@ def send_api_action(sb, token: str, action="restart") -> bool:
 # ============================================================
 
 def run_script():
-    print("🔧 启动浏览器 (v2.0 保活巡检版)...")
+    print("🔧 启动浏览器...")
 
     sb_kwargs = dict(uc=True, test=True)
     if LOCAL_PROXY:
@@ -288,7 +432,7 @@ def run_script():
     with SB(**sb_kwargs) as sb:
         print("🚀 浏览器就绪！")
 
-        # ── IP 验证 ──────────────────────────────────────────
+        # ── 1. IP 验证 ───────────────────────────────────────
         print("🌐 验证出口IP...")
         try:
             sb.open("https://api.ipify.org/?format=json")
@@ -297,49 +441,15 @@ def run_script():
         except Exception:
             print("⚠️ IP验证超时，跳过")
 
-        # ── 登录 ─────────────────────────────────────────────
+        # ── 2. 登录 ──────────────────────────────────────────
         print("🔑 打开登录页面...")
         sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
         time.sleep(4)
 
-        print("✏️ 填写账号密码...")
-        try:
-            sb.wait_for_element_visible("input[type='password']", timeout=25)
-            user_selectors = [
-                "input[placeholder*='utilisateur']",
-                "input[name='pseudo']",
-                "input[name='email']",
-                "input[type='text']",
-                "input[type='email']",
-                "input:not([type='password']):not([type='checkbox']):not([type='hidden'])"
-            ]
-            typed_user = False
-            for sel in user_selectors:
-                if sb.is_element_visible(sel):
-                    sb.click(sel)
-                    time.sleep(0.3)
-                    sb.type(sel, EMAIL)
-                    print(f"✅ 已使用选择器填写账号: {sel}")
-                    typed_user = True
-                    break
-            if not typed_user:
-                raise RuntimeError("未找到可见的账号输入框")
-
-            sb.click("input[type='password']")
-            time.sleep(0.3)
-            # 在密码结尾附带 \n 触发原生表单回车提交
-            sb.type("input[type='password']", PASSWORD + "\n")
-            time.sleep(1)
-        except Exception as e:
-            print(f"❌ 登录框加载失败：{e}")
+        if not fill_and_submit_login(sb):
             sb.save_screenshot("login_fail.png")
-            send_tg("❌ 登录框加载失败", f"原因: {e}", photo_path="login_fail.png")
+            send_tg("❌ 登录框加载失败", "未能找到或填入账号密码输入框", photo_path="login_fail.png")
             return
-
-        print("📤 提交登录请求...")
-        # 等待 2 秒让页面隐式 Turnstile 初始化完成再点按钮
-        time.sleep(2)
-        trigger_login_submit(sb)
 
         print("⏳ 等待登录跳转...")
         for sec in range(45):
@@ -348,86 +458,88 @@ def run_script():
                 if "/connexion" not in cur_url:
                     print(f"✅ 登录成功！当前页：{cur_url}")
                     break
-                # 如果卡在登录页，第 10 秒和第 22 秒自动重试点击一次按钮（应对后台 Turnstile 延迟加载）
+                # 若第 10 秒或第 22 秒仍未跳转，自动补点一次验证与登录按钮
                 if sec in (10, 22):
-                    print(f"🔄 等待 {sec}s 仍未跳转，尝试补充点击登录按钮...")
+                    print(f"🔄 等待 {sec}s 未跳转，尝试补充点击登录按钮...")
                     try:
                         sb.uc_gui_click_captcha()
                     except Exception:
                         pass
-                    trigger_login_submit(sb)
+                    trigger_login_button(sb)
             except Exception:
                 pass
             time.sleep(1)
         else:
             print("❌ 登录等待超时")
             sb.save_screenshot("login_timeout.png")
-            send_tg("❌ 登录等待超时", "提交账号密码后页面未跳转，请查看截图提示", photo_path="login_timeout.png")
+            send_tg("❌ 登录等待超时", "提交账号密码后页面未跳转，请查看截图", photo_path="login_timeout.png")
             return
 
-        # ── 跳转服务器管理页 ──────────────────────────────────
+        # ── 3. 跳转服务器管理页并注入监听器 ──────────────────
         print(f"🔃 跳转至服务器管理页：{SERVER_URL}")
         sb.open(SERVER_URL)
         time.sleep(5)
+        print(f"📄 当前页面：{sb.get_current_url()}")
+        inject_listener(sb)
+        sb.save_screenshot("server_page.png")
+
+        # ── 4. 执行页面按钮点击（离线点 Démarrer 开机 / 在线点黄色按钮重启）
+        power_res = check_server_and_click_power(sb)
+        ui_clicked = power_res.get("clicked", False)
+        action_type = power_res.get("action_type") or "restart"
+        action_detail = power_res.get("detail") or "未匹配到按钮"
+        before_status = power_res.get("status", "unknown")
+
+        # 点击按钮后会触发网页自身的 Turnstile 验证，等待几秒检查是否有弹窗或 Token
+        time.sleep(4)
         try:
-            sb.execute_script(INJECT_TOKEN_LISTENER_JS)
+            sb.uc_gui_click_captcha()
         except Exception:
             pass
-        print(f"📄 当前页面：{sb.get_current_url()}")
 
-        # ── 检查续期按钮与服务器状态 ──────────────────────────
-        info = check_and_click_renew(sb)
-        banner_text   = info.get("banner_text") or "未读取到横幅提示"
-        srv_status    = info.get("server_status", "unknown")
-        renew_found   = info.get("renew_found", False)
-        start_clicked = info.get("start_clicked", False)
+        # ── 5. 尝试获取 Token 并调用 API 双重保障 ────────────
+        token = wait_for_token(sb, timeout=15)
+        api_ok = False
+        if token:
+            api_ok = send_power_api(sb, token, action=action_type)
+            if not api_ok and action_type == "restart":
+                api_ok = send_power_api(sb, token, action="start")
 
-        print(f"📊 检测结果 -> 在线状态: {srv_status} | 发现续期按钮: {renew_found} | 横幅: {banner_text}")
-
-        # 情况 A：发现了 Renew 按钮并已点击
-        if renew_found:
-            btn_txt = info.get("renew_clicked_text", "Renew")
-            print(f"🎉 已点击续期按钮 [{btn_txt}]，等待可能弹出的验证码或弹窗...")
-            time.sleep(4)
-            try:
-                sb.uc_gui_click_captcha()
-            except Exception:
-                pass
-            time.sleep(5)
-            sb.open(SERVER_URL)
-            time.sleep(5)
-            new_info = check_and_click_renew(sb)
-            new_banner = new_info.get("banner_text") or banner_text
-            sb.save_screenshot("renew_success.png")
+        if not ui_clicked and not api_ok:
+            sb.save_screenshot("api_fail.png")
             send_tg(
-                "✅ 自动续期成功！",
-                f"🔘 点击按钮: {btn_txt}\n🟢 服务器状态: {srv_status}\n⏰ 最新提示: {new_banner}",
-                photo_path="renew_success.png"
+                "❌ 重启/开机操作失败",
+                f"当前状态: {before_status}\nUI按钮与API均未能成功触发",
+                photo_path="api_fail.png"
             )
             return
 
-        # 情况 B：未到续期窗口（没有 Renew 按钮）
-        token = ""
-        try:
-            token = sb.execute_script(READ_TOKEN_JS) or ""
-        except Exception:
-            pass
+        # ── 6. 等待服务器启动/重启并刷新页面读取最新 4 小时倒计时 ──
+        print("🔄 等待 12 秒让服务器完成开机/重启状态刷新...")
+        time.sleep(12)
+        sb.open(SERVER_URL)
+        time.sleep(6)
+        sb.save_screenshot("restart_success.png")
 
-        if token and len(token) > 30:
-            print(f"✅ 捕获到页面 Token（长度 {len(token)}），发送保活指令...")
-            send_api_action(sb, token, action="start" if srv_status == "Offline" else "restart")
-            time.sleep(5)
+        remaining = get_countdown_text(sb)
+        after_check = sb.execute_script("""
+            (function(){
+                var t = document.body.innerText || '';
+                if (/En ligne|Online/i.test(t)) return 'Online (运行中)';
+                if (/Hors ligne|Offline/i.test(t)) return 'Offline (关机/启动中)';
+                return '未知';
+            })()
+        """)
 
-        sb.save_screenshot("status_check.png")
-        extra_note = "\n🚀 检测到服务器离线，已自动点击开机按钮！" if start_clicked else ""
-        detail_msg = (
-            f"🟢 服务器状态: {srv_status}\n"
-            f"⏳ 续期按钮: 暂未出现（未到到期前续期窗口）\n"
-            f"📢 面板提示: {banner_text}"
-            f"{extra_note}"
+        countdown_line = f"⏰ 关机倒计时: {remaining}" if remaining else "⏰ 关机倒计时: 正在初始化（请查看截图）"
+        summary = (
+            f"📌 操作前状态: {before_status}\n"
+            f"🛠 执行动作: {action_detail}\n"
+            f"🟢 当前状态: {after_check}\n"
+            f"{countdown_line}"
         )
-        print(f"ℹ️ 巡检完成：\n{detail_msg}")
-        send_tg("ℹ️ 巡检正常（未到续期窗口）", detail_msg, photo_path="status_check.png")
+        print(f"⏱️ 执行完成：\n{summary}")
+        send_tg("✅ 4小时重启/开机保活成功！", summary, photo_path="restart_success.png")
 
 
 if __name__ == "__main__":
