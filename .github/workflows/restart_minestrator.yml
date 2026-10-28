@@ -21,20 +21,29 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 🛡️ 启动 GOST 代理转发
+      - name: 🛡️ 启动代理客户端 (sing-box)
         if: ${{ env.GOST_PROXY != '' }}
         env:
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
+          NODE_URL: ${{ secrets.GOST_PROXY }}
         run: |
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-          echo "📦 GOST 版本: $VERSION"
-          wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
-          tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
-          chmod +x gost
-          nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
+          # 1. 生成客户端配置文件
+          python gen_proxy.py "$NODE_URL"
+
+          # 2. 下载并安装 sing-box
+          SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+          echo "📦 sing-box 版本: $SB_VER"
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
+          tar -xzf "sing-box-${SB_VER}-linux-amd64.tar.gz"
+          mv sing-box-${SB_VER}-linux-amd64/sing-box ./sing-box
+          chmod +x sing-box
+
+          # 3. 后台启动并在本地 8080 端口提供 HTTP 代理
+          nohup ./sing-box run -c sing-box-config.json > singbox.log 2>&1 &
           sleep 3
-          echo "✅ GOST 已启动，测试连通性..."
-          curl -s -x http://127.0.0.1:8080 https://api.ipify.org
+
+          # 4. 测试代理出口连通性
+          echo "✅ 代理客户端已启动，测试连通性..."
+          curl -s -x http://127.0.0.1:8080 https://api.ipify.org || cat singbox.log
 
       - name: 🛠️ 安装系统依赖
         run: |
