@@ -22,33 +22,41 @@ jobs:
           python-version: '3.10'
 
       - name: 🛡️ 启动代理客户端 (sing-box)
-        if: ${{ env.GOST_PROXY != '' }}
         env:
           NODE_URL: ${{ secrets.GOST_PROXY }}
         run: |
+          if [ -z "$NODE_URL" ]; then
+            echo "⚠️ 未配置 GOST_PROXY Secret，跳过代理启动"
+            exit 0
+          fi
+
           # 1. 生成客户端配置文件
           python gen_proxy.py "$NODE_URL"
+          echo "📄 生成的配置结构检查："
+          cat sing-box-config.json | sed 's/"password": "[^"]*"/"password": "***"/g; s/"uuid": "[^"]*"/"uuid": "***"/g'
 
-          # 2. 下载并安装 sing-box
-          SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-          echo "📦 sing-box 版本: $SB_VER"
+          # 2. 下载并安装 sing-box (固定稳定版 1.10.7)
+          SB_VER="1.10.7"
+          echo "📦 下载 sing-box 版本: $SB_VER"
           wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
           tar -xzf "sing-box-${SB_VER}-linux-amd64.tar.gz"
           mv sing-box-${SB_VER}-linux-amd64/sing-box ./sing-box
           chmod +x sing-box
 
-          # 3. 后台启动并在本地 8080 端口提供 HTTP 代理
+          # 3. 后台启动并在本地 8080 端口提供代理
           nohup ./sing-box run -c sing-box-config.json > singbox.log 2>&1 &
           sleep 3
 
-          # 4. 测试代理出口连通性
-          echo "✅ 代理客户端已启动，测试连通性..."
-          curl -s -x http://127.0.0.1:8080 https://api.ipify.org || cat singbox.log
+          # 4. 检查运行日志与出口连通性
+          echo "📋 sing-box 运行日志："
+          cat singbox.log
+          echo "🌐 测试代理出口连通性..."
+          curl -f -s --connect-timeout 15 -x http://127.0.0.1:8080 https://api.ipify.org
+          echo ""
 
       - name: 🛠️ 安装系统依赖
         run: |
           sudo apt-get update
-          # 修复：ubuntu-latest 默认源没有 google-chrome-stable，改用 seleniumbase 内置安装
           sudo apt-get install -y xvfb x11-utils xdotool scrot
 
       - name: 🐍 安装 Python 依赖
