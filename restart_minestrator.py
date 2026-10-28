@@ -92,7 +92,7 @@ def send_tg(result, detail='', photo_path=None):
 
 
 # ============================================================
-# Invisible Turnstile：注入监听器 + Hook 捕获 Token
+# Invisible Turnstile：注入监听器 + Hook 捕获 Token 与响应
 # ============================================================
 
 INJECT_TOKEN_LISTENER_JS = """
@@ -102,18 +102,15 @@ INJECT_TOKEN_LISTENER_JS = """
     window.__cf_turnstile_token__ = '';
     window.__captured_auth_header__ = '';
 
-    // 1. 监听 Cloudflare Turnstile postMessage 事件
     window.addEventListener('message', function(e) {
         if (!e.origin || e.origin.indexOf('cloudflare.com') === -1) return;
         var d = e.data;
         if (!d) return;
         if (d.token && d.token.length > 30) {
-            console.log('[TokenCapture] postMessage token length:', d.token.length);
             window.__cf_turnstile_token__ = d.token;
         }
     });
 
-    // 2. Hook window.fetch，捕获网页自身发出的 turnstile_token 和 Authorization
     var origFetch = window.fetch;
     window.fetch = function() {
         var args = arguments;
@@ -134,7 +131,6 @@ INJECT_TOKEN_LISTENER_JS = """
         return origFetch.apply(this, args);
     };
 
-    // 3. 定时轮询页面隐藏的 turnstile input 与全局对象
     setInterval(function() {
         try {
             var inputs = document.querySelectorAll(
@@ -167,7 +163,7 @@ def inject_listener(sb):
         print(f"⚠️ 监听器注入失败：{e}")
 
 
-def wait_for_token(sb, timeout=25) -> str:
+def wait_for_token(sb, timeout=15) -> str:
     print(f"⏳ 等待 Turnstile Token 自动生成（最多 {timeout} 秒）...")
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -182,84 +178,6 @@ def wait_for_token(sb, timeout=25) -> str:
 
     print("ℹ️ 未单独捕获到明文 Turnstile Token")
     return ''
-
-
-# ============================================================
-# 登录辅助：兼容新版 Vue/React 登录表单与多方式提交
-# ============================================================
-
-def fill_and_submit_login(sb) -> bool:
-    print("✏️ 填写账号密码...")
-    try:
-        sb.wait_for_element_visible("input[type='password']", timeout=25)
-
-        # 使用原生 setter 写入值并派发完整事件链，确保前端框架绑定生效
-        fill_js = """
-        (function(email, pwd) {
-            var userInp = document.querySelector("input[placeholder*='utilisateur']")
-                       || document.querySelector("input[name='pseudo']")
-                       || document.querySelector("input[name='email']")
-                       || document.querySelector("input[type='text']")
-                       || document.querySelector("input[type='email']");
-            var passInp = document.querySelector("input[type='password']");
-            if (!userInp || !passInp) return false;
-
-            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            ).set;
-
-            nativeInputValueSetter.call(userInp, email);
-            userInp.dispatchEvent(new Event('input', { bubbles: true }));
-            userInp.dispatchEvent(new Event('change', { bubbles: true }));
-
-            nativeInputValueSetter.call(passInp, pwd);
-            passInp.dispatchEvent(new Event('input', { bubbles: true }));
-            passInp.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-        })(arguments[0], arguments[1]);
-        """
-        ok = sb.execute_script(fill_js, EMAIL, PASSWORD)
-        if not ok:
-            # 备用常规输入
-            sb.type("input[placeholder*='utilisateur'], input[type='text']", EMAIL)
-            sb.type("input[type='password']", PASSWORD)
-        print("✅ 账号密码已填入并同步表单状态")
-    except Exception as e:
-        print(f"❌ 登录框加载或填写失败：{e}")
-        return False
-
-    time.sleep(2)
-    print("📤 提交登录请求...")
-    trigger_login_button(sb)
-    return True
-
-
-def trigger_login_button(sb):
-    """尝试通过 Selenium 原生点击 + JS 点击触发 Se connecter 按钮"""
-    try:
-        if sb.is_element_visible("button:contains('Se connecter')"):
-            sb.click("button:contains('Se connecter')")
-            print("✅ 已点击 Se connecter 登录按钮")
-            return
-    except Exception:
-        pass
-
-    try:
-        sb.execute_script("""
-            (function(){
-                var btns = Array.from(document.querySelectorAll('button'));
-                var target = btns.find(function(b){
-                    return b.textContent.indexOf('Se connecter') !== -1 || b.type === 'submit';
-                });
-                if (target) {
-                    target.removeAttribute('disabled');
-                    target.click();
-                }
-            })()
-        """)
-        print("✅ 已通过 JS 触发 Se connecter 登录按钮")
-    except Exception as e:
-        print(f"⚠️ 点击登录按钮异常：{e}")
 
 
 # ============================================================
@@ -284,7 +202,6 @@ def check_server_and_click_power(sb) -> dict:
 
         var bodyText = document.body.innerText || '';
 
-        // 1. 提取右上角 4 小时倒计时（如 S'éteint dans 3h 32m 50s）
         var mTimer = bodyText.match(/S'éteint dans\\s+([^\\n]+)/i)
                   || bodyText.match(/Shutting down in\\s+([^\\n]+)/i)
                   || bodyText.match(/\\d+h\\s+\\d+m\\s+\\d+s/);
@@ -292,7 +209,6 @@ def check_server_and_click_power(sb) -> dict:
             res.countdown = mTimer[0].trim();
         }
 
-        // 2. 判断当前状态是 Hors ligne (Offline) 还是 En ligne (Online)
         if (/Hors ligne|Serveur hors ligne|Offline|Server offline/i.test(bodyText)) {
             res.status = 'Offline (已关机)';
         } else if (/En ligne|Online/i.test(bodyText)) {
@@ -301,7 +217,7 @@ def check_server_and_click_power(sb) -> dict:
 
         var allBtns = Array.from(document.querySelectorAll('button'));
 
-        // 3. 情况 A：服务器处于关机状态 -> 寻找绿色 Démarrer / Start 按钮并点击开机
+        // 1. 情况 A：服务器处于关机状态 -> 寻找绿色 Démarrer / Start 按钮并点击开机
         for (var i = 0; i < allBtns.length; i++) {
             var b = allBtns[i];
             if (b.offsetParent === null || b.disabled) continue;
@@ -315,7 +231,7 @@ def check_server_and_click_power(sb) -> dict:
             }
         }
 
-        // 4. 情况 B：服务器处于运行中状态 -> 寻找左上角并排的三个控制按钮（蓝、黄、红），点击中间黄色重启按钮
+        // 2. 情况 B：服务器处于运行中状态 -> 寻找左上角并排的三个控制按钮（蓝、黄、红），点击中间黄色重启按钮
         for (var j = 0; j < allBtns.length; j++) {
             var parent = allBtns[j].parentElement;
             if (!parent) continue;
@@ -377,7 +293,7 @@ def get_countdown_text(sb) -> str:
 
 
 # ============================================================
-# API：通过浏览器 fetch 发送重启/启动指令（携带登录 Cookie）
+# API：通过浏览器 fetch 发送重启/启动指令（不使用 arguments，兼容 CDP）
 # ============================================================
 
 def send_power_api(sb, token: str, action: str = "restart") -> bool:
@@ -385,34 +301,84 @@ def send_power_api(sb, token: str, action: str = "restart") -> bool:
         return False
     token_js = json.dumps(token)
     auth_js = json.dumps(AUTH_TOKEN)
-    script = (
-        "var done = arguments[0];"
-        "var authHeader = window.__captured_auth_header__ || " + auth_js + ";"
-        'fetch("' + API_URL + '", {'
-        '  method: "PUT",'
-        '  headers: {'
-        '    "Authorization": authHeader,'
-        '    "Content-Type": "application/json",'
-        '    "Accept": "application/json",'
-        '    "X-Requested-With": "XMLHttpRequest"'
-        '  },'
-        '  body: JSON.stringify({poweraction: "' + action + '", turnstile_token: ' + token_js + '})'
-        '})'
-        '.then(function(r){ return r.json(); })'
-        '.then(function(data){ done({ok: true, data: data}); })'
-        '.catch(function(err){ done({ok: false, error: err.toString()}); });'
-    )
+    api_url_js = json.dumps(API_URL)
+    action_js = json.dumps(action)
+
+    # 使用全局变量轮询代替 execute_async_script 的 arguments[0]，彻底杜绝 ReferenceError: arguments is not defined
+    trigger_js = f"""
+    (function() {{
+        window.__api_power_done__ = false;
+        window.__api_power_result__ = null;
+        var authHeader = window.__captured_auth_header__ || {auth_js};
+        fetch({api_url_js}, {{
+            method: "PUT",
+            headers: {{
+                "Authorization": authHeader,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest"
+            }},
+            body: JSON.stringify({{poweraction: {action_js}, turnstile_token: {token_js}}})
+        }})
+        .then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+            window.__api_power_result__ = {{ok: true, data: data}};
+            window.__api_power_done__ = true;
+        }})
+        .catch(function(err) {{
+            window.__api_power_result__ = {{ok: false, error: err.toString()}};
+            window.__api_power_done__ = true;
+        }});
+    }})()
+    """
     try:
-        result = sb.execute_async_script(script)
-        print(f"📡 API ({action}) 响应：{result}")
-        if result.get("ok") and result.get("data", {}).get("api", {}).get("code") == 200:
-            print(f"✅ API ({action}) 指令已成功送达！")
-            return True
-        print(f"⚠️ API ({action}) 返回非 200：{result}")
+        sb.execute_script(trigger_js)
+        for _ in range(15):
+            done = sb.execute_script("(function(){ return !!window.__api_power_done__; })()")
+            if done:
+                result = sb.execute_script("(function(){ return window.__api_power_result__; })()") or {}
+                print(f"📡 API ({action}) 响应：{result}")
+                if result.get("ok") and result.get("data", {}).get("api", {}).get("code") == 200:
+                    print(f"✅ API ({action}) 指令已成功送达！")
+                    return True
+                return False
+            time.sleep(1)
         return False
     except Exception as e:
         print(f"⚠️ API 请求异常：{e}")
         return False
+
+
+def click_login_btn(sb):
+    """点击登录按钮（不使用 arguments）"""
+    try:
+        if sb.is_element_visible("button:contains('Se connecter')"):
+            sb.click("button:contains('Se connecter')")
+            print("✅ 已点击 Se connecter 登录按钮")
+            return
+        elif sb.is_element_visible("button[type='submit']"):
+            sb.click("button[type='submit']")
+            print("✅ 已点击 submit 登录按钮")
+            return
+    except Exception:
+        pass
+
+    try:
+        sb.execute_script("""
+            (function(){
+                var btns = Array.from(document.querySelectorAll('button'));
+                var target = btns.find(function(b){
+                    return b.textContent.indexOf('Se connecter') !== -1 || b.type === 'submit';
+                });
+                if (target) {
+                    target.removeAttribute('disabled');
+                    target.click();
+                }
+            })()
+        """)
+        print("✅ 已通过 JS 触发登录按钮点击")
+    except Exception as e:
+        print(f"⚠️ 登录按钮点击异常：{e}")
 
 
 # ============================================================
@@ -441,15 +407,43 @@ def run_script():
         except Exception:
             print("⚠️ IP验证超时，跳过")
 
-        # ── 2. 登录 ──────────────────────────────────────────
+        # ── 2. 登录（采用第8轮已验证成功的原生 sb.type 方式）───
         print("🔑 打开登录页面...")
-        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
-        time.sleep(4)
+        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
+        time.sleep(3)
 
-        if not fill_and_submit_login(sb):
+        print("✏️ 填写账号密码...")
+        try:
+            sb.wait_for_element_visible("input[type='password']", timeout=25)
+
+            user_selectors = [
+                "input[placeholder*='utilisateur']",
+                "input[name='pseudo']",
+                "input[name='email']",
+                "input[type='text']",
+                "input[type='email']",
+                "input:not([type='password']):not([type='checkbox']):not([type='hidden'])"
+            ]
+            typed_user = False
+            for sel in user_selectors:
+                if sb.is_element_visible(sel):
+                    sb.type(sel, EMAIL)
+                    print(f"✅ 已使用选择器填写账号: {sel}")
+                    typed_user = True
+                    break
+            if not typed_user:
+                raise RuntimeError("未找到可见的账号输入框")
+
+            sb.type("input[type='password']", PASSWORD)
+        except Exception as e:
+            print(f"❌ 登录框加载或填写失败：{e}")
             sb.save_screenshot("login_fail.png")
-            send_tg("❌ 登录框加载失败", "未能找到或填入账号密码输入框", photo_path="login_fail.png")
+            send_tg("❌ 登录框加载失败", f"原因: {e}", photo_path="login_fail.png")
             return
+
+        print("📤 提交登录请求...")
+        time.sleep(1)
+        click_login_btn(sb)
 
         print("⏳ 等待登录跳转...")
         for sec in range(45):
@@ -458,14 +452,9 @@ def run_script():
                 if "/connexion" not in cur_url:
                     print(f"✅ 登录成功！当前页：{cur_url}")
                     break
-                # 若第 10 秒或第 22 秒仍未跳转，自动补点一次验证与登录按钮
-                if sec in (10, 22):
-                    print(f"🔄 等待 {sec}s 未跳转，尝试补充点击登录按钮...")
-                    try:
-                        sb.uc_gui_click_captcha()
-                    except Exception:
-                        pass
-                    trigger_login_button(sb)
+                if sec in (12, 25):
+                    print(f"🔄 等待 {sec}s 仍未跳转，尝试补充点击登录按钮...")
+                    click_login_btn(sb)
             except Exception:
                 pass
             time.sleep(1)
@@ -490,7 +479,6 @@ def run_script():
         action_detail = power_res.get("detail") or "未匹配到按钮"
         before_status = power_res.get("status", "unknown")
 
-        # 点击按钮后会触发网页自身的 Turnstile 验证，等待几秒检查是否有弹窗或 Token
         time.sleep(4)
         try:
             sb.uc_gui_click_captcha()
