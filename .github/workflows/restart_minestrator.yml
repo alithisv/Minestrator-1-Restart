@@ -3,10 +3,7 @@ name: Minestrator-Restart
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 1 * * *'   # 北京时间 09:00
-    - cron: '0 5 * * *'   # 北京时间 13:00
-    - cron: '0 9 * * *'   # 北京时间 17:00
-    - cron: '0 13 * * *'  # 北京时间 21:00
+    - cron: '0 */3 * * *'   # 每 3 小时自动执行一次，防止 GitHub Actions 延迟导致满 4 小时被关机
 
 jobs:
   run_minestrator_restart:
@@ -30,12 +27,10 @@ jobs:
             exit 0
           fi
 
-          # 1. 生成客户端配置文件
           python gen_proxy.py "$NODE_URL"
           echo "📄 生成的配置结构检查："
           cat sing-box-config.json | sed 's/"password": "[^"]*"/"password": "***"/g; s/"uuid": "[^"]*"/"uuid": "***"/g'
 
-          # 2. 下载并安装 sing-box (固定稳定版 1.10.7)
           SB_VER="1.10.7"
           echo "📦 下载 sing-box 版本: $SB_VER"
           wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
@@ -43,11 +38,9 @@ jobs:
           mv sing-box-${SB_VER}-linux-amd64/sing-box ./sing-box
           chmod +x sing-box
 
-          # 3. 后台启动并在本地 8080 端口提供代理
           nohup ./sing-box run -c sing-box-config.json > singbox.log 2>&1 &
           sleep 3
 
-          # 4. 检查运行日志与出口连通性
           echo "📋 sing-box 运行日志："
           cat singbox.log
           echo "🌐 测试代理出口连通性..."
