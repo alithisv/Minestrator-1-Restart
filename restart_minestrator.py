@@ -44,6 +44,7 @@ def send_tg(result, detail='', photo_path=None):
         f"{detail}"
     ).strip()
 
+    # 如果提供了截图文件且文件存在，调用 sendPhoto 直接把图片发到 TG
     if photo_path and os.path.exists(photo_path):
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
         boundary = uuid.uuid4().hex
@@ -79,6 +80,7 @@ def send_tg(result, detail='', photo_path=None):
         except Exception as e:
             print(f"⚠️ TG图片推送失败，回退为纯文本推送：{e}")
 
+    # 纯文本推送
     url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": msg}).encode()
     try:
@@ -90,7 +92,7 @@ def send_tg(result, detail='', photo_path=None):
 
 
 # ============================================================
-# Invisible Turnstile：CDP 预注入 + Hook 拦截
+# Invisible Turnstile：注入监听器，轮询等待 token
 # ============================================================
 
 INJECT_TOKEN_LISTENER_JS = """
@@ -99,140 +101,79 @@ INJECT_TOKEN_LISTENER_JS = """
     window.__cf_token_listener_injected__ = true;
     window.__cf_turnstile_token__ = '';
 
-    // 1. 监听 postMessage
     window.addEventListener('message', function(e) {
         if (!e.origin || e.origin.indexOf('cloudflare.com') === -1) return;
         var d = e.data;
-        if (!d) return;
-        if (d.token && d.token.length > 30) {
-            window.__cf_turnstile_token__ = d.token;
+        if (!d || d.event !== 'complete' || !d.token) return;
+
+        console.log('[TokenCapture] complete, token length:', d.token.length);
+        window.__cf_turnstile_token__ = d.token;
+
+        var inputs = document.querySelectorAll(
+            'input[name="cf-turnstile-response"], input[name="cf_turnstile_response"]'
+        );
+        for (var i = 0; i < inputs.length; i++) {
+            try {
+                var nativeSet = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSet.call(inputs[i], d.token);
+                inputs[i].dispatchEvent(new Event('input',  {bubbles: true}));
+                inputs[i].dispatchEvent(new Event('change', {bubbles: true}));
+            } catch(err) {
+                inputs[i].value = d.token;
+            }
         }
     });
-
-    // 2. 拦截 fetch 请求，自动记录页面自身发出的 turnstile_token 或 Authorization
-    var origFetch = window.fetch;
-    window.fetch = function() {
-        var args = arguments;
-        try {
-            if (args[1] && args[1].body && typeof args[1].body === 'string') {
-                var parsed = JSON.parse(args[1].body);
-                if (parsed.turnstile_token) {
-                    window.__cf_turnstile_token__ = parsed.turnstile_token;
-                }
-            }
-        } catch(e) {}
-        return origFetch.apply(this, args);
-    };
-
-    // 3. 定时扫描页面所有隐藏 input 与 turnstile 对象
-    setInterval(function() {
-        try {
-            var inputs = document.querySelectorAll('input[name*="turnstile"], input[name*="cf-"], textarea[name*="cf-"]');
-            for (var i = 0; i < inputs.length; i++) {
-                if (inputs[i].value && inputs[i].value.length > 30) {
-                    window.__cf_turnstile_token__ = inputs[i].value;
-                }
-            }
-            if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-                var resp = window.turnstile.getResponse();
-                if (resp && resp.length > 30) {
-                    window.__cf_turnstile_token__ = resp;
-                }
-            }
-        } catch(e) {}
-    }, 500);
+    console.log('[TokenCapture] listener injected');
 })();
 """
 
 READ_TOKEN_JS = "(function(){ return window.__cf_turnstile_token__ || ''; })()"
 
 
-def pre_inject_listener(sb):
-    """在页面打开前通过 CDP 预注入脚本，确保不错过加载初期的 Turnstile Token"""
-    try:
-        sb.driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": INJECT_TOKEN_LISTENER_JS}
-        )
-        print("📡 CDP 预注入 Turnstile 监听器已启用")
-    except Exception as e:
-        print(f"⚠️ CDP 预注入失败：{e}")
-
+def inject_listener(sb):
     try:
         sb.execute_script(INJECT_TOKEN_LISTENER_JS)
-    except Exception:
-        pass
-
-
-def click_power_button_ui(sb) -> bool:
-    """
-    直接在网页左上角控制面板点击重启（黄色按钮）或启动（蓝色按钮）。
-    点击后不仅能直接触发网页原生重启，也会触发 Invisible Turnstile 刷新 Token。
-    """
-    print("🖱️ 尝试在网页面板直接点击重启/启动按钮...")
-    js_click_power = """
-    (function() {
-        // 查找左上角 Online/Offline 状态区域下方的三个电源控制按钮（蓝=启动，黄=重启，红=停止）
-        var allBtns = Array.from(document.querySelectorAll('button'));
-        
-        // 策略1：寻找包含 svg 图标且靠近 Online / Support code 区域的三个并排按钮
-        for (var i = 0; i < allBtns.length; i++) {
-            var parent = allBtns[i].parentElement;
-            if (!parent) continue;
-            var siblingBtns = parent.querySelectorAll(':scope > button');
-            if (siblingBtns.length === 3) {
-                var startBtn = siblingBtns[0];   // 蓝色：启动
-                var restartBtn = siblingBtns[1]; // 黄色：重启
-                if (!restartBtn.disabled) {
-                    restartBtn.click();
-                    return 'clicked_restart_btn';
-                } else if (!startBtn.disabled) {
-                    startBtn.click();
-                    return 'clicked_start_btn';
-                }
-            }
-        }
-
-        // 策略2：根据按钮背景色/类名匹配（琥珀黄 warning / 蓝色 primary）
-        var warnBtn = document.querySelector('button[class*="warning"], button[class*="yellow"], button[class*="amber"]');
-        if (warnBtn && !warnBtn.disabled) {
-            warnBtn.click();
-            return 'clicked_warning_color_btn';
-        }
-        return '';
-    })()
-    """
-    try:
-        res = sb.execute_script(js_click_power)
-        if res:
-            print(f"✅ 成功触发面板电源按钮: {res}")
-            return True
-        else:
-            print("⚠️ 未匹配到并排的三个电源按钮")
-            return False
+        print("📡 Turnstile 监听器已注入")
     except Exception as e:
-        print(f"⚠️ UI 点击异常: {e}")
-        return False
+        print(f"⚠️ 监听器注入失败：{e}")
 
 
-def wait_for_token(sb, timeout=25) -> str:
-    print(f"⏳ 等待 Turnstile Token 捕获（最多 {timeout} 秒）...")
+def wait_for_token(sb, timeout=60) -> str:
+    print(f"⏳ 等待 Turnstile Token 自动生成（最多 {timeout} 秒）...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             token = sb.execute_script(READ_TOKEN_JS)
-            if token and len(token) > 30:
+            if token and len(token) > 50:
                 print(f"✅ Token 已捕获（长度 {len(token)}）")
+                return token
+        except Exception:
+            pass
+        try:
+            token = sb.execute_script("""
+                (function(){
+                    var inp = document.querySelector('input[name="cf-turnstile-response"], input[name="cf_turnstile_response"]');
+                    return (inp && inp.value && inp.value.length > 50) ? inp.value : '';
+                })()
+            """)
+            if token:
+                print(f"✅ Token 从 input 读取（长度 {len(token)}）")
                 return token
         except Exception:
             pass
         time.sleep(1)
 
-    print("ℹ️ 未单独捕获到明文 Token")
+    print("❌ 等待 Token 超时")
     return ''
 
 
-def send_restart(sb, token: str, action="restart") -> bool:
+# ============================================================
+# API：通过浏览器 fetch 发送重启指令（携带登录 Cookie）
+# ============================================================
+
+def send_restart(sb, token: str) -> bool:
     token_js = json.dumps(token)
     script = (
         "var done = arguments[0];"
@@ -244,7 +185,7 @@ def send_restart(sb, token: str, action="restart") -> bool:
         '    "Accept": "application/json",'
         '    "X-Requested-With": "XMLHttpRequest"'
         '  },'
-        '  body: JSON.stringify({poweraction: "' + action + '", turnstile_token: ' + token_js + '})'
+        '  body: JSON.stringify({poweraction: "restart", turnstile_token: ' + token_js + '})'
         '})'
         '.then(function(r){ return r.json(); })'
         '.then(function(data){ done({ok: true, data: data}); })'
@@ -252,40 +193,15 @@ def send_restart(sb, token: str, action="restart") -> bool:
     )
     try:
         result = sb.execute_async_script(script)
-        print(f"📡 API ({action}) 响应：{result}")
+        print(f"📡 API响应：{result}")
         if result.get("ok") and result.get("data", {}).get("api", {}).get("code") == 200:
-            print(f"✅ API {action} 指令已成功送达！")
+            print("✅ 重启指令已成功送达！")
             return True
+        print(f"❌ API返回异常：{result}")
         return False
     except Exception as e:
         print(f"⚠️ API请求异常：{e}")
         return False
-
-
-def extract_remaining_info(sb) -> str:
-    """从页面顶部横幅提取到期时间或利用期限"""
-    try:
-        info = sb.execute_script(r"""
-            (function(){
-                // 匹配顶部黄色试用期提示横幅文字
-                var bodyText = document.body.innerText || '';
-                var m1 = bodyText.match(/expires permanently on [^\.\n]+/i);
-                if (m1) return m1[0];
-                var m2 = bodyText.match(/202\d年\d+月\d+日[^\.\n，。]+/);
-                if (m2) return m2[0];
-
-                var spans = document.querySelectorAll('[data-slot="base"] span');
-                var parts = [];
-                for (var i = 0; i < spans.length; i++) {
-                    var t = spans[i].textContent.trim();
-                    if (/^\d+[hms]$/.test(t)) parts.push(t);
-                }
-                return parts.length ? parts.join(' ') : '';
-            })()
-        """)
-        return info or ""
-    except Exception:
-        return ""
 
 
 # ============================================================
@@ -304,9 +220,6 @@ def run_script():
 
     with SB(**sb_kwargs) as sb:
         print("🚀 浏览器就绪！")
-
-        # 启用 CDP 预注入，所有后续打开的页面都会在第一行 JS 执行前挂载 Token 拦截器
-        pre_inject_listener(sb)
 
         # ── IP 验证 ──────────────────────────────────────────
         print("🌐 验证出口IP...")
@@ -353,6 +266,7 @@ def run_script():
 
         print("📤 提交登录请求...")
         try:
+            # 优先使用 SeleniumBase 原生点击，失败则使用 IIFE 闭包包裹的 JS 点击（避免 Illegal return statement）
             if sb.is_element_visible("button:contains('Se connecter')"):
                 sb.click("button:contains('Se connecter')")
                 print("✅ 已点击 Se connecter 登录按钮")
@@ -393,42 +307,50 @@ def run_script():
 
         # ── 跳转服务器管理页 ──────────────────────────────────
         print(f"🔃 跳转至服务器管理页：{SERVER_URL}")
-        pre_inject_listener(sb)
         sb.open(SERVER_URL)
-        time.sleep(5)
+        time.sleep(3)
         print(f"📄 当前页面：{sb.get_current_url()}")
         sb.save_screenshot("server_page.png")
 
-        # ── 方式1：直接点击网页左上角的黄色重启/蓝色启动按钮 ──
-        ui_clicked = click_power_button_ui(sb)
-        time.sleep(3)
+        # ── 注入监听器 ────────────────────────────────────────
+        inject_listener(sb)
 
-        # ── 方式2：等待并检查是否捕获到 Turnstile Token ──
-        token = wait_for_token(sb, timeout=20)
-        api_ok = False
-        if token:
-            api_ok = send_restart(sb, token, action="restart")
-            if not api_ok:
-                api_ok = send_restart(sb, token, action="start")
-
-        # 如果既没拿到 Token 调 API，UI 点击也没成功，才算真正失败
-        if not ui_clicked and not api_ok:
-            sb.save_screenshot("restart_fail.png")
-            send_tg("❌ 重启操作未生效", "UI 按钮与 Token 均未触发成功", photo_path="restart_fail.png")
+        # ── 等待 Token ────────────────────────────────────────
+        token = wait_for_token(sb, timeout=60)
+        if not token:
+            sb.save_screenshot("token_timeout.png")
+            send_tg("❌ Token 获取超时", "Turnstile 未能自动完成", photo_path="token_timeout.png")
             return
 
-        # ── 刷新页面，等待状态与剩余时间更新 ──────────────────
-        print("🔄 等待 8 秒后刷新页面确认服务器状态...")
-        time.sleep(8)
+        # ── 发送重启指令 ──────────────────────────────────────
+        if not send_restart(sb, token):
+            sb.save_screenshot("api_fail.png")
+            send_tg("❌ API 重启请求失败", f"Token长度={len(token)}", photo_path="api_fail.png")
+            return
+
+        # ── 刷新页面，等待剩余时间更新 ──────────────────────
+        print("🔄 刷新页面等待利用期限更新...")
+        time.sleep(5)
         sb.open(SERVER_URL)
         time.sleep(5)
         sb.save_screenshot("restart_success.png")
-
-        remaining = extract_remaining_info(sb)
-        mode_str = "UI面板按钮点击" if ui_clicked else "API指令发送"
-        detail = f"🛠 触发方式：{mode_str}\n⏰ 状态信息：{remaining}" if remaining else f"🛠 触发方式：{mode_str}\n⏰ 状态信息：已执行重启（详见截图）"
+        try:
+            remaining = sb.execute_script(r"""
+                (function(){
+                    var spans = document.querySelectorAll('[data-slot="base"] span');
+                    var parts = [];
+                    for (var i = 0; i < spans.length; i++) {
+                        var t = spans[i].textContent.trim();
+                        if (/^\d+[hms]$/.test(t)) parts.push(t);
+                    }
+                    return parts.length ? parts.join(' ') : '';
+                })()
+            """)
+            detail = f"⏰ 利用期限：{remaining}" if remaining else "⏰ 利用期限：已刷新（请查看截图）"
+        except Exception:
+            detail = "⏰ 利用期限：获取失败"
         print(f"⏱️ {detail}")
-        send_tg("✅ 重启指令已执行！", detail, photo_path="restart_success.png")
+        send_tg("✅ 重启成功！", detail, photo_path="restart_success.png")
 
 
 if __name__ == "__main__":
